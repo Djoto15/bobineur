@@ -1,7 +1,7 @@
 /*
   Coil winder - 2 stepper motors (A4988 / DRV8825 drivers, 1/16 microstepping)
   Motor 1 = spool, motor 2 = carriage on a TR8x8 lead screw (Prusa MK3/MK4 type).
-  Controlled over serial (9600 baud) by the Python GUI, or by hand in the serial monitor.
+  Controlled over serial (115200 baud) by the Python GUI, or by hand in the serial monitor.
 
   MANUAL MODE
     S;speed1;speed2         signed rpm: >0 forward, <0 reverse, 0 stop
@@ -15,9 +15,10 @@
         dir    = carriage direction for the first layer (1 or -1)
         e.g.  W;0.5;22;10;60;1
     P = pause    R = resume    X = abort (or stop everything when idle)
+    ?                        identify -> ID;WINDER;1
 
   Replies:
-    READY                    at startup
+    READY;WINDER             at startup
     OK / ERR ...             command accepted / refused
     WINDING                  winding started
     T;turn;layer             progress, once per spool turn
@@ -92,6 +93,9 @@ int  reportLayer = 0;
 const unsigned long RAMP_PERIOD_MS = 10;
 unsigned long lastRamp = 0;
 
+const char FIRMWARE_ID[] = "WINDER";
+const int  FIRMWARE_VERSION = 1;
+
 char buffer[40];
 byte length = 0;
 unsigned long lastCharTime = 0;
@@ -99,7 +103,7 @@ unsigned long lastCharTime = 0;
 // ---------------------------------------------------------------
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   for (int i = 0; i < 2; i++) {
     pinMode(motors[i].pinDir, OUTPUT);
@@ -109,7 +113,8 @@ void setup() {
     digitalWrite(motors[i].pinEnable, HOLD_TORQUE_WHEN_STOPPED ? LOW : HIGH); // HIGH = driver disabled
   }
 
-  Serial.println(F("READY"));
+  Serial.print(F("READY;"));
+  Serial.println(FIRMWARE_ID);
 }
 
 void loop() {
@@ -339,7 +344,7 @@ void processCommand(char *cmd) {
   }
   if (n == 0) return;
 
-  char c = (f[0][1] == '\0') ? toupper(f[0][0]) : '?';
+  char c = (f[0][1] == '\0') ? toupper(f[0][0]) : 0;
 
   switch (c) {
     case 'S':
@@ -353,6 +358,12 @@ void processCommand(char *cmd) {
     case 'P': cmdPause();  break;
     case 'R': cmdResume(); break;
     case 'X': cmdAbort();  break;
+    case '?':
+      Serial.print(F("ID;"));
+      Serial.print(FIRMWARE_ID);
+      Serial.print(';');
+      Serial.println(FIRMWARE_VERSION);
+      break;
     default:  Serial.println(F("ERR unknown command"));
   }
 }

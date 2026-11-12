@@ -1,125 +1,401 @@
+/*
+  Current source - PWM-driven MOSFET on D9 + INA219 current sensor (DFRobot SEN0291, 0.01 ohm shunt).
+  Closed-loop PID regulation of the current, or open-loop PWM.
+  Controlled over serial (115200 baud) by the Python GUI, or by hand in the serial monitor.
+  Telemetry lines stay compatible with the Arduino Serial Plotter.
+
+  COMMANDS (one per line, fields separated by ';', any line ending)
+    <number>          shortcut for C;<number>   e.g. "40"
+    C;mA              closed-loop regulation at mA (0 = output off)
+    O;pwm             open loop: fixed PWM duty 0..255
+    X                 output off
+    K;kp;ki;kd        PID gains (output in PWM counts: counts/mA, counts/(mA.s), counts.s/mA)
+    T;ms              control / telemetry period, 10..2000 ms
+    A;alpha           low-pass filter weight of a new sample, 0.01..1 (1 = no filtering)
+    L;mA              over-current trip limit on the raw measurement (0 = disabled)
+    F;0|1             PWM frequency on D9: 0 = 490 Hz (Arduino default), 1 = 31.25 kHz
+    B;0|1             at power-up: 0 = output off, 1 = regulate at the saved setpoint
+    Z                 reset the integrator
+    G                 get settings -> P;mode;setpoint;pwm;kp;ki;kd;period;alpha;limit;fast;boot
+                                      (mode: 0 = off, 1 = regulation, 2 = open loop)
+    E                 save settings to EEPROM
+    D                 restore default settings (not saved until E)
+    ?                 identify     -> ID;CURRENT;2
+
+  REPLIES
+    READY;CURRENT                 at startup
+    OK / ERR ...                  command accepted / refused
+    FAULT;OVERCURRENT;mA          output cut by the over-current protection
+    FAULT;SENSOR                  INA219 not found (output kept off, retried every second)
+    Consigne:..,Courant:..,Filtre:..,PWM:..,Tension:..    telemetry, once per period
+*/
+
 #include <Wire.h>
+#include <EEPROM.h>
 #include <Adafruit_INA219.h>
 
-// Instanciation de l'INA219 avec son adresse I2C matérielle (0x45)
-Adafruit_INA219 ina219(0x45);
-//dafruit_INA219 ina219;
+// ===================== SETTINGS =====================
+const uint8_t INA219_ADDR      = 0x45;     // hardware I2C address of the INA219
+const uint16_t INA219_CONFIG   = 0x39EF;   // 32 V range, gain /8 (320 mV), shunt ADC 12-bit x32 samples (~17 ms), continuous
+/*
+ * Shunt correction: the Adafruit library assumes a 0.1 ohm shunt (R100), the DFRobot SEN0291
+ * module uses 0.01 ohm (R010). The library value is therefore 10x too low.
+ */
+const float SHUNT_CORRECTION   = 10.0;
+const float MAX_SETPOINT_MA    = 1000.0;   // must match CURRENT_MAX_MA in the Python GUI
+const int   PWM_PIN            = 9;        // Timer1 / OC1A
+// ====================================================
 
-const int PWM_PIN = 9;
+const char FIRMWARE_ID[] = "CURRENT";
+const int  FIRMWARE_VERSION = 2;
 
-// Consigne de courant initiale en mA (ex: 40 mA pour le test avec la résistance 220 Ohms)
-float consigneCourant_mA = 40.0;
-float courantFiltre_mA = 0.0;
+enum Mode : uint8_t { MODE_OFF = 0, MODE_REGULATION = 1, MODE_OPEN_LOOP = 2 };
 
-// Coefficients du correcteur PI (doux pour éviter l'instabilité et les oscillations)
-const float Kp = 0.05;
-const float Ki = 0.01;
-float integral = 0.0;
-float rapportCyclique = 0.0;
+struct Settings {
+  uint16_t magic;
+  float setpoint_mA;
+  float kp, ki, kd;
+  uint16_t period_ms;
+  float alpha;
+  float limit_mA;
+  uint8_t fastPwm;
+  uint8_t bootRegulation;
+};
 
-unsigned long dernierTemps = 0;
-const unsigned long INTERVALLE_MS = 200; // Période d'échantillonnage de 400 ms (2.5 Hz)
+const uint16_t SETTINGS_MAGIC = 0xC0A2;    // change when the Settings layout changes
 
-void ina219WriteConfig(uint16_t cfg){
-  Wire.beginTransmission(0x45);
-  Wire.write(0x00);
-  Wire.write(cfg >> 8);
-  Wire.write(cfg & 0xFF);
-  Wire.endTransmission();
-}
+// Defaults. ki = 0.25 reproduces the previous incremental controller
+// (duty += 0.05 * error every 200 ms  <=>  0.25 counts per mA.s).
+const Settings DEFAULTS = { SETTINGS_MAGIC, 40.0, 0.0, 0.25, 0.0, 200, 0.10, 1000.0, 0, 0 };
+
+Adafruit_INA219 ina219(INA219_ADDR);
+Settings cfg;
+
+Mode  mode = MODE_OFF;
+float openLoopPwm = 0;        // duty used in open-loop mode
+float duty = 0;               // duty currently applied (0..255)
+float integral = 0;           // integral term, in PWM counts
+float filtered_mA = 0;
+float previousFiltered = 0;
+bool  sensorOk = false;
+bool  firstSample = true;
+
+unsigned long lastControl = 0;
+unsigned long lastSensorRetry = 0;
+
+char buffer[48];
+byte length = 0;
+unsigned long lastCharTime = 0;
+
+// ---------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
-  //Serial.setTimeout(20); // Timeout court pour ne pas bloquer la boucle lors de la saisie série
-
-  // Configuration du Timer 1 pour générer un PWM rapide à 31.25 kHz sur D9
-  // (permet de lisser parfaitement le courant dans la charge et supprime tout sifflement audible)
-  //TCCR1A = _BV(COM1A1) | _BV(WGM10);
-  //TCCR1B = _BV(CS10);
-
   pinMode(PWM_PIN, OUTPUT);
   analogWrite(PWM_PIN, 0);
 
-  if (!ina219.begin()) {
-    Serial.println(F("Erreur : INA219 non detecte a l'adresse 0x45 !"));
-    while (1);
-  }
+  loadSettings();
+  applyPwmFrequency();
+  Serial.print(F("READY;"));
+  Serial.println(FIRMWARE_ID);
 
-  // Configure l'INA219 pour moyenner 32 mesures en interne sur le shunt
-  // Réduit drastiquement le bruit sans ralentir la boucle
-  // 0x391F = Plage 32V, Gain /8 (320mV), Shunt ADC: 12-bit 16 samples (~8.5 ms)
-  ina219WriteConfig(0x39EF);
-
-  Serial.println(F("Etage de puissance initialise"));
-  Serial.println(F("Entre une consigne en mA (ex: 40) :"));
+  initSensor();
+  if (cfg.bootRegulation && cfg.setpoint_mA > 0) mode = MODE_REGULATION;
 }
 
 void loop() {
-  // 1. Lecture d'une éventuelle nouvelle consigne envoyée via le moniteur / traceur série
-  if (Serial.available() > 0) {
-    float nouvelleConsigne = Serial.parseFloat();
-    
-    // Purge des caractères résiduels dans le buffer (\r, \n, espaces)
-    // afin d'éviter que le retour chariot ne réinitialise la consigne à 0.0
-    while (Serial.available() > 0) {
-      Serial.read();
+  readSerial();
+
+  unsigned long now = millis();
+  if (!sensorOk) {
+    if (now - lastSensorRetry >= 1000) {
+      lastSensorRetry = now;
+      initSensor();
     }
-    
-    if (nouvelleConsigne >= 0.0 && nouvelleConsigne <= 1000.0) {
-      consigneCourant_mA = nouvelleConsigne;
-      integral = 0.0; // Réinitialise l'intégrateur pour éviter tout à-coup
-    }
+    return;
   }
 
-  // 2. Boucle de régulation à cadence fixe (20 ms)
-  unsigned long maintenant = millis();
-  if (maintenant - dernierTemps >= INTERVALLE_MS) {
-    dernierTemps = maintenant;
+  if (now - lastControl >= cfg.period_ms) {
+    float dt = (now - lastControl) / 1000.0;
+    if (dt > 4.0 * cfg.period_ms / 1000.0) dt = cfg.period_ms / 1000.0;   // first run / long stall
+    lastControl = now;
+    controlStep(dt);
+  }
+}
 
-    /*
-     * EXPLICATION DU FACTEUR * 10.0 :
-     * La bibliothèque Adafruit_INA219 est configurée en dur pour une résistance shunt standard
-     * de 0.1 Ohm (marquée R100). Or, le module DFRobot SEN0291 intègre une résistance shunt
-     * de 0.01 Ohm (marquée R010) pour pouvoir mesurer des courants plus élevés.
-     * Comme I = U_shunt / R_shunt et que le shunt réel est 10 fois plus petit que celui
-     * attendu par le calcul interne de la bibliothèque, la valeur renvoyée est 10 fois trop faible.
-     * Multiplier la lecture par 10.0 rétablit la valeur physique exacte en mA.
-     */
-    float mesureBrute = 0;
-    mesureBrute = ina219.getCurrent_mA() * 10.0;
-    if (mesureBrute < 0.0) mesureBrute = 0.0;
+// ---------------------------------------------------------------
+// Sensor
 
-    // Filtre passe-bas exponentiel pour éliminer le bruit de hachage et l'aliasing
-    courantFiltre_mA = (0.90 * courantFiltre_mA) + (0.10 * mesureBrute);
+void ina219WriteConfig(uint16_t value) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(0x00);
+  Wire.write(value >> 8);
+  Wire.write(value & 0xFF);
+  Wire.endTransmission();
+}
 
-    if (consigneCourant_mA <= 0.0) {
-      rapportCyclique = 0.0;
-      integral = 0.0;
-    } else {
-      float erreur = consigneCourant_mA - courantFiltre_mA;
+void initSensor() {
+  sensorOk = ina219.begin();
+  if (sensorOk) {
+    ina219WriteConfig(INA219_CONFIG);
+    firstSample = true;
+    lastControl = millis();
+  } else {
+    setOutputOff();
+    Serial.println(F("FAULT;SENSOR"));
+  }
+}
 
-      // Accumulation intégrale avec borne anti-emballement (anti-windup)
-      integral += erreur * (INTERVALLE_MS / 1000.0);
-      integral = constrain(integral, 0.0, 100.0);
+// ---------------------------------------------------------------
+// Control
 
-      // Calcul de la correction PI
-      float commande = (Kp * erreur) + (Ki * integral);
-      
-      // Mise à jour progressive du rapport cyclique (0 à 255)
-      rapportCyclique = constrain(rapportCyclique + commande, 0.0, 255.0);
+void controlStep(float dt) {
+  float raw_mA = ina219.getCurrent_mA() * SHUNT_CORRECTION;
+  if (raw_mA < 0.0) raw_mA = 0.0;
+  float bus_V = ina219.getBusVoltage_V();
+
+  // Exponential low-pass filter against switching noise and aliasing
+  if (firstSample) {
+    filtered_mA = raw_mA;
+    previousFiltered = raw_mA;
+    firstSample = false;
+  } else {
+    filtered_mA += cfg.alpha * (raw_mA - filtered_mA);
+  }
+
+  if (cfg.limit_mA > 0 && raw_mA > cfg.limit_mA && mode != MODE_OFF) {
+    setOutputOff();
+    Serial.print(F("FAULT;OVERCURRENT;"));
+    Serial.println(raw_mA);
+  }
+
+  if (mode == MODE_REGULATION) {
+    float error = cfg.setpoint_mA - filtered_mA;
+    float p = cfg.kp * error;
+    // Derivative on the measurement: no kick when the setpoint changes
+    float d = (dt > 0) ? -cfg.kd * (filtered_mA - previousFiltered) / dt : 0;
+
+    // Integrate only when it does not push the output further into saturation (anti-windup)
+    float candidate = integral + cfg.ki * error * dt;
+    float u = p + candidate + d;
+    if (!((u > 255.0 && error > 0) || (u < 0.0 && error < 0))) integral = candidate;
+    integral = constrain(integral, 0.0, 255.0);
+
+    duty = constrain(p + integral + d, 0.0, 255.0);
+  } else if (mode == MODE_OPEN_LOOP) {
+    duty = openLoopPwm;
+  } else {
+    duty = 0;
+  }
+  previousFiltered = filtered_mA;
+
+  analogWrite(PWM_PIN, (int)(duty + 0.5));
+
+  // Telemetry (Serial Plotter format)
+  Serial.print(F("Consigne:"));
+  Serial.print(mode == MODE_REGULATION ? cfg.setpoint_mA : 0.0);
+  Serial.print(F(",Courant:"));
+  Serial.print(raw_mA);
+  Serial.print(F(",Filtre:"));
+  Serial.print(filtered_mA);
+  Serial.print(F(",PWM:"));
+  Serial.print((int)(duty + 0.5));
+  Serial.print(F(",Tension:"));
+  Serial.println(bus_V, 3);
+}
+
+void setOutputOff() {
+  mode = MODE_OFF;
+  duty = 0;
+  integral = 0;
+  analogWrite(PWM_PIN, 0);
+}
+
+void startRegulation(float setpoint) {
+  cfg.setpoint_mA = setpoint;
+  if (setpoint <= 0) { setOutputOff(); return; }
+  if (mode != MODE_REGULATION) {
+    integral = duty;          // bumpless transfer from open loop / off
+    mode = MODE_REGULATION;
+  }
+}
+
+// Timer1 prescaler: 1 -> 31.25 kHz, 64 -> 490 Hz (8-bit phase-correct PWM set up by the core)
+void applyPwmFrequency() {
+  TCCR1B = (TCCR1B & 0xF8) | (cfg.fastPwm ? _BV(CS10) : (_BV(CS11) | _BV(CS10)));
+}
+
+// ---------------------------------------------------------------
+// Settings
+
+bool settingsValid(const Settings &s) {
+  return s.magic == SETTINGS_MAGIC
+      && s.setpoint_mA >= 0 && s.setpoint_mA <= MAX_SETPOINT_MA
+      && s.period_ms >= 10 && s.period_ms <= 2000
+      && s.alpha > 0 && s.alpha <= 1
+      && s.kp >= 0 && s.ki >= 0 && s.kd >= 0;   // also false for NaN
+}
+
+void loadSettings() {
+  EEPROM.get(0, cfg);
+  if (!settingsValid(cfg)) cfg = DEFAULTS;
+}
+
+void printSettings() {
+  Serial.print(F("P;"));
+  Serial.print(mode);                 Serial.print(';');
+  Serial.print(cfg.setpoint_mA, 2);   Serial.print(';');
+  Serial.print((int)openLoopPwm);     Serial.print(';');
+  Serial.print(cfg.kp, 5);            Serial.print(';');
+  Serial.print(cfg.ki, 5);            Serial.print(';');
+  Serial.print(cfg.kd, 5);            Serial.print(';');
+  Serial.print(cfg.period_ms);        Serial.print(';');
+  Serial.print(cfg.alpha, 3);         Serial.print(';');
+  Serial.print(cfg.limit_mA, 1);      Serial.print(';');
+  Serial.print(cfg.fastPwm);          Serial.print(';');
+  Serial.println(cfg.bootRegulation);
+}
+
+// ---------------------------------------------------------------
+// Serial
+
+// A command is processed on a line ending, OR after 50 ms without a new character
+// (works with "No line ending" in the serial monitor).
+void readSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    lastCharTime = millis();
+    if (c == '\n' || c == '\r') {
+      submitBuffer();
+    } else if (c != ' ' && length < sizeof(buffer) - 1) {
+      buffer[length++] = c;
     }
+  }
+  if (length > 0 && millis() - lastCharTime > 50) submitBuffer();
+}
 
-    // Application du signal PWM sur la grille du MOSFET via la broche D9
-    analogWrite(PWM_PIN, (int)rapportCyclique);
+void submitBuffer() {
+  if (length == 0) return;
+  buffer[length] = '\0';
+  processCommand(buffer);
+  length = 0;
+}
 
-    // Télémétrie au format compatible avec le Traceur série (Serial Plotter)
-    Serial.print(F("Consigne:"));
-    Serial.print(consigneCourant_mA);
-    Serial.print(F(",Courant:"));
-    Serial.print(mesureBrute);
-    Serial.print(F(",Courant filtre:"));
-    Serial.print(courantFiltre_mA);
-    Serial.print(F(",PWM:"));
-    Serial.println((int)rapportCyclique);
+void ok()                    { Serial.println(F("OK")); }
+void err(const __FlashStringHelper *msg) { Serial.print(F("ERR ")); Serial.println(msg); }
+
+void processCommand(char *cmd) {
+  // Bare number = new setpoint (same behaviour as the original sketch)
+  if (isdigit(cmd[0]) || cmd[0] == '.') {
+    float sp = atof(cmd);
+    if (sp < 0 || sp > MAX_SETPOINT_MA) { err(F("setpoint out of range")); return; }
+    startRegulation(sp);
+    ok();
+    return;
+  }
+
+  char *f[5];
+  int n = 0;
+  char *tok = strtok(cmd, ";");
+  while (tok != NULL && n < 5) {
+    f[n++] = tok;
+    tok = strtok(NULL, ";");
+  }
+  if (n == 0) return;
+  char c = (f[0][1] == '\0') ? toupper(f[0][0]) : 0;
+
+  switch (c) {
+    case 'C': {
+      if (n != 2) { err(F("format: C;mA")); return; }
+      float sp = atof(f[1]);
+      if (sp < 0 || sp > MAX_SETPOINT_MA) { err(F("setpoint out of range")); return; }
+      if (!sensorOk) { err(F("sensor not found")); return; }
+      startRegulation(sp);
+      ok();
+      break;
+    }
+    case 'O': {
+      if (n != 2) { err(F("format: O;pwm")); return; }
+      int pwm = atoi(f[1]);
+      if (pwm < 0 || pwm > 255) { err(F("pwm: 0 to 255")); return; }
+      if (!sensorOk) { err(F("sensor not found")); return; }
+      openLoopPwm = pwm;
+      mode = MODE_OPEN_LOOP;
+      integral = 0;
+      ok();
+      break;
+    }
+    case 'X':
+      setOutputOff();
+      ok();
+      break;
+    case 'K': {
+      if (n != 4) { err(F("format: K;kp;ki;kd")); return; }
+      float kp = atof(f[1]), ki = atof(f[2]), kd = atof(f[3]);
+      if (kp < 0 || ki < 0 || kd < 0 || kp > 1000 || ki > 1000 || kd > 1000) { err(F("gains: 0 to 1000")); return; }
+      cfg.kp = kp; cfg.ki = ki; cfg.kd = kd;
+      ok();
+      break;
+    }
+    case 'T': {
+      if (n != 2) { err(F("format: T;ms")); return; }
+      long ms = atol(f[1]);
+      if (ms < 10 || ms > 2000) { err(F("period: 10 to 2000 ms")); return; }
+      cfg.period_ms = ms;
+      ok();
+      break;
+    }
+    case 'A': {
+      if (n != 2) { err(F("format: A;alpha")); return; }
+      float a = atof(f[1]);
+      if (a < 0.01 || a > 1.0) { err(F("alpha: 0.01 to 1")); return; }
+      cfg.alpha = a;
+      ok();
+      break;
+    }
+    case 'L': {
+      if (n != 2) { err(F("format: L;mA")); return; }
+      float l = atof(f[1]);
+      if (l < 0) { err(F("limit must be >= 0")); return; }
+      cfg.limit_mA = l;
+      ok();
+      break;
+    }
+    case 'F':
+      if (n != 2) { err(F("format: F;0|1")); return; }
+      cfg.fastPwm = atoi(f[1]) ? 1 : 0;
+      applyPwmFrequency();
+      ok();
+      break;
+    case 'B':
+      if (n != 2) { err(F("format: B;0|1")); return; }
+      cfg.bootRegulation = atoi(f[1]) ? 1 : 0;
+      ok();
+      break;
+    case 'Z':
+      integral = 0;
+      ok();
+      break;
+    case 'G':
+      printSettings();
+      break;
+    case 'E':
+      cfg.magic = SETTINGS_MAGIC;
+      EEPROM.put(0, cfg);
+      ok();
+      break;
+    case 'D':
+      cfg = DEFAULTS;
+      applyPwmFrequency();
+      ok();
+      break;
+    case '?':
+      Serial.print(F("ID;"));
+      Serial.print(FIRMWARE_ID);
+      Serial.print(';');
+      Serial.println(FIRMWARE_VERSION);
+      break;
+    default:
+      err(F("unknown command"));
   }
 }

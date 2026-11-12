@@ -1,1 +1,6 @@
 .venv
+__pycache__/
+build/
+dist/
+*.spec
+coil_winder_settings.json
